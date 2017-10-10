@@ -219,7 +219,7 @@ HTML
 # XXX these only does sha1=>file
 # should this go in the current directory or should it be in cache dir? then it
 # needs a better name
-my $datadir = 'SHA1SUMS';
+my $datafile = 'SHA1SUMS';
 
 sub sha ($) {
 	return unless (my $fh = &openr);

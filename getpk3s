@@ -1,0 +1,486 @@
+#!/usr/bin/perl
+# This program is free software. You can redistribute and/or modify it under
+# the same terms as Tremulous (i.e., GNU General Public License version 2 or
+# later).
+# Copyright © M. Kristall
+
+our $VERSION = v1.0.0;
+use strict;
+# fail early if all requirements are not met
+use File::Spec::Functions qw(catfile splitdir);
+use File::Copy qw(cp);
+use Cwd qw(abs_path);
+require Digest;
+# these are not core modules
+require LWP::UserAgent;
+require HTML::Parser;
+
+### hoorah for inline testing
+BEGIN {
+	if ($ENV{TEST}) {
+		require Test::More;
+		Test::More->import;
+	}
+}
+END {
+	done_testing () if ($ENV{TEST});
+}
+###
+
+$0 =~ s/^(?:.+\/)?([^\/]+)$/$1/;
+
+sub mkdirp ($) {
+	my @dir = splitdir ($_[0]);
+	for (my $i = 0; $i < @dir; $i++) {
+		my $dir = catfile (@dir[0 .. $i]);
+		next if ($dir[$i] eq '' || $dir[$i] eq '.');
+		return unless ((-d $dir) || mkdir ($dir));
+	}
+	1;
+}
+
+if ($ENV{TEST}) {
+	my $tmp = File::Spec->tmpdir;
+	my @dir = ('someunlikelypath', 'a', 'b', 'c');
+	is (mkdirp (catfile ($tmp, @dir)), 1,
+		'mkdir -p ' . catfile ($tmp, @dir));
+	for (my $i = $#dir; $i > -1; $i--) {
+		rmdir (catfile ($tmp, @dir[0 .. $i]));
+	}
+	isnt (-d catfile ($tmp, @dir), 1,
+		'rm -r ' . catfile ($tmp, @dir));
+}
+
+# if we store config stuff, setting its path should go here too
+my $cache;
+if ($^O eq 'MSWin32') {
+	require Win32;
+	$cache = Win32::GetFolderPath (Win32::CSIDL_LOCAL_APPDATA (), 1);
+} elsif ($^O eq 'darwin') {
+	$cache = "$ENV{HOME}/Library/Cache";
+} elsif ($^O eq 'linux') {
+	$cache = "$ENV{HOME}/.cache";
+} else {
+	die ("(currently?) unsupported platform $^O\n");
+}
+$cache = catfile ($cache, 'paklist.html');
+#die ("mkdir -p '$cachedir'\n") unless (mkdirp ($cachedir));
+
+our %cache;
+# sha1 => {name, type{}, size, sha1, md5, links[]}
+# md5 => sha1
+# name => {name => [sha1]}
+sub register ($) {
+	my $pk3 = $_[0];
+	# sha1 is the primary index
+	$cache{$pk3->{sha1}} = $pk3;
+	$cache{md5}{$pk3->{md5}} = $pk3->{sha1};
+	push (@{$cache{name}{lc ($pk3->{name})}}, $pk3->{sha1});
+}
+
+sub search ($) {
+	my $q = $_[0];
+	if ($q =~ /^[\dA-Fa-f]{32}$/) {
+		return exists ($cache{md5}{$q}) ? $cache{$cache{md5}{$q}} : ();
+	}
+	if ($q =~ /^[\dA-Fa-f]{40}$/) {
+		return exists ($cache{$q}) ? $cache{$cache{$q}} : ();
+	}
+#	if (-e $q) {
+		# try to find the sha1 from a SHA1SUMS file and return info from
+		# that. else, complain that that file is not known and maybe it
+		# should be hosted somewhere and submitted to
+		# <https://betaserv.tk/adduri>
+#	}
+	if (index ($q, '://') > -1) {
+		# find matching URI
+		foreach my $pk3 (values (%cache)) {
+			next unless (exists ($pk3->{links}));
+			foreach (@{$pk3->{links}}) {
+				return $pk3 if ($_ eq $q);
+			}
+		}
+		return;
+	}
+	# handle wildcards
+	my $re = join ('.*', map {
+		quotemeta
+	} split (/\*/, '*' . lc ($q) . '*'));
+	$re = qr/$re/;
+#	if (lc (substr ($q, -4)) eq '.pk3') {
+		return map {
+			@{$cache{name}{$_}}
+		} grep {
+			$_ =~ $re
+		} keys (%{$cache{name}});
+#	}
+	# is this a map search? we can't do that
+}
+
+sub openr ($) {
+	warn ("open '$_[0]': $!\n") unless (open (my $fh, '<', $_[0]));
+	$fh;
+}
+
+my $UA = "$0/" . ord ($VERSION);
+sub ua (%) {
+	LWP::UserAgent->new (agent => $UA, @_);
+}
+
+# XXX configurable
+my $maxage = 86400;
+my $uri = 'https://betaserv.tk/paklist.html';
+sub freshen ($$;$) {
+	my ($uri, $file, $progress) = @_;
+	return 1 if ((-e $file) && (stat ($file))[9] > time - $maxage);
+	ua (show_progress => $progress)->mirror ($uri, $file);
+}
+
+sub getpak ($;$) {
+	my ($pak, $progress) = @_;
+	return unless (my @uris = @{$$pak{links}});
+	if (-e $$pak{name}) {
+		$$pak{name} =~ s/(\.\w+)?$/-substr ($$pak{md5}, -7) . $1/ei;
+		unlink ($$pak{name});
+	}
+	my $ua = ua (show_progress => $progress);
+	$ua->mirror ($uris[rand (@uris)], $$pak{name});
+}
+
+sub getcache ($) {
+	return unless (my $fh = &openr);
+	# interested in
+	#<h2[ data-info=size,md5,sha1][ class="types"]>text</h2>
+	#<a href=uri>mirror</a> (after the </h2>)
+	my $pk3;
+	my $p = HTML::Parser->new (
+		api_version => 3,
+		unbroken_text => 1,
+		start_h => [sub ($$$) {
+			my ($self, $tag, $attr) = @_;
+			if ($tag eq 'h2') {
+				register ($pk3) if ($pk3);
+				$pk3 = {links => []};
+				@$pk3{qw(size md5 sha1)} =
+					split (/,/, $attr->{'data-info'}, 3);
+				$pk3->{size} = hex ($pk3->{size});
+				if (exists ($attr->{class})) {
+					$pk3->{type} = {map {
+						$_ => 1
+					} split (/ /, $attr->{class})};
+				}
+				# should also record alternate names for search
+				# skip <a> in <h2>...</h2>
+				$self->report_tags ('h2');
+			} elsif ($tag eq 'a') {
+				push (@{$pk3->{links}}, $attr->{href});
+			}
+		}, 'self,tagname,attr'],
+		end_h => [sub ($$) {
+			my ($self, $tag) = @_;
+			if ($tag eq 'h2') {
+				$self->report_tags (qw(a h2));
+			}
+		}, 'self,tagname'],
+		text_h => [sub ($$) {
+			my ($self, $text) = @_;
+			if ($pk3 && $pk3->{name} eq '') {
+				$pk3->{name} = $text;
+			}
+		}, 'self,dtext']
+	);
+	$p->report_tags ('h2');
+	$p->parse_file ($fh);
+	register ($pk3) if ($pk3);
+	1;
+}
+
+###
+is_deeply (do {
+	local %cache;
+	getcache (\<<'HTML');
+<html><body><main id=showall><section id=c08ce71d74a86e66d3cb3b6ec2602ac09941e17f>
+<h2 id=data_1_1_0_pk3 data-info=2ad83a8,f4ef2fc3bf2b971c41d6458ad1da5ca2,c08ce71d74a86e66d3cb3b6ec2602ac09941e17f class="ui"><a href=#data_1_1_0_pk3>data-1.1.0.pk3</a></h2>
+<ul><li><a href=http://example.com/>example.com</a><li><a href=http://www.example.com/>www.example.com</a>
+</ul></section></main>
+HTML
+	$cache{(values (%{$cache{md5}}))[0]};
+}, {
+	size => 0x2ad83a8,
+	md5 => 'f4ef2fc3bf2b971c41d6458ad1da5ca2',
+	sha1 => 'c08ce71d74a86e66d3cb3b6ec2602ac09941e17f',
+	type => {ui => 1},
+	name => 'data-1.1.0.pk3',
+	links => [qw(http://example.com/ http://www.example.com/)]
+}, 'getcache()') if ($ENV{TEST});
+###
+
+# populate file<=>sha1 mapping
+# XXX these only does sha1=>file
+# should this go in the current directory or should it be in cache dir? then it
+# needs a better name
+my $datadir = 'SHA1SUMS';
+
+sub sha ($) {
+	return unless (my $fh = &openr);
+	binmode ($fh);
+	Digest->new ('SHA-1')->addfile ($fh)->hexdigest;
+}
+
+sub datapopulate ($;$) {
+	my ($dir, $progress) = @_;
+	return unless (opendir (my $dh, $dir));
+	my $r = 0;
+	local $| = 1 if ($_[1]);
+	my $map = {
+		file => {},
+		sha1 => {}
+	};
+	while (my $file = readdir ($dh)) {
+		# skip dotfiles and files not ending in .pk3
+		next if (substr ($file, 0, 1) eq '.');
+		next if (lc (substr ($file, -4)) ne '.pk3');
+		if ($progress) {
+			print "\r", " " x $r, "\r", $file;
+			$r = length ($file);
+		}
+		my $path = catfile ($dir, $file);
+		if (my $sha = sha ($path)) {
+			$$map{file}{$file} = $sha;
+			$$map{sha1}{$sha} = $file;
+		} else {
+			warn ("$path: $!\n");
+		}
+	}
+	print "\r", " " x $r, "\r" if ($progress);
+	$map;
+}
+
+sub dataread ($) {
+	return unless (my $fh = &openr);
+	my $map = {
+		file => {},
+		sha1 => {}
+	};
+	while (<$fh>) {
+		my ($sha1, $file) = split (/  /, $_, 2);
+		chomp ($file);
+		$$map{file}{$file} = $sha1;
+		$$map{sha1}{$sha1} = $file;
+	}
+	$map;
+}
+
+sub datawrite ($$) {
+	my ($file, $map) = @_;
+	my $fh;
+	unless (open ($fh, '>', $file)) {
+		warn ("open '$file': $!\n");
+		return;
+	}
+	binmode ($fh);
+	print $fh "$$map{file}{$_}  $_\n" foreach (sort keys (%{$$map{file}}));
+	1;
+}
+
+###
+if ($ENV{TEST}) {
+	my @pk3 = qw(data-1.1.0.pk3 c08ce71d74a86e66d3cb3b6ec2602ac09941e17f);
+	my $map = {
+		file => {@pk3},
+		sha1 => {reverse (@pk3)}
+	};
+	my $file;
+	datawrite (\$file, $map);
+	is_deeply (dataread (\$file), $map, 'datawrite(), dataread()');
+}
+###
+
+sub prsize ($) {
+	sprintf ('%3.1f%s',
+		$_[0] > 805306368 ? ($_[0] / 2 ** 30, 'GB') :
+		$_[0] > 786432 ? ($_[0] / 2 ** 20, 'MB') :
+		$_[0] > 768 ? ($_[0] / 2 ** 10, 'kB') :
+		($_[0], 'B'));
+}
+
+sub prpak ($;$) {
+	my ($r, $bold) = @_;
+	printf "  %s%-40s %15s %s%s\n", $bold ? "\033[1m" : '',
+		$$r{name},
+		join (', ', sort keys (%{$$r{type}})),
+		prsize ($$r{size}),
+		"\033[0m";
+}
+
+sub prompt ($) {
+	my $r;
+	do {
+		print "$_[0] (y/n)? ";
+		STDOUT->flush;
+		chomp ($r = lc (<STDIN>));
+	} while ($r ne 'y' && $r ne 'n');
+	$r eq 'y';
+}
+
+###
+my (%verb, %help);
+$help{init} = "Initialize specified directories for use with $0";
+sub init (@) {
+	my @args = @_ ? @_ : ('.');
+	foreach my $dir (@args) {
+		die ("$dir is not a directory\n") if (!-d $dir);
+		my $map = datapopulate ($dir, 1);
+		die ("$dir: $!\n") unless ($map);
+		datawrite (catfile ($dir, $datafile), $map);
+	}
+}
+$verb{init} = \&init;
+
+$help{verify} = "Verify the PK3s in specified directories";
+sub verify (@) {
+	my @args = @_ ? @_ : ('.');
+	my $ok = 0;
+	my $total = 0;
+	foreach my $dir (@args) {
+		print "Verify $dir\n";
+		die ("$dir is not a directory\n") if (!-d $dir);
+		my $map = dataread (catfile ($dir, $datafile));
+		die ("$datafile missing from $dir (did you 'init'?)\n")
+			unless ($map);
+		$total += keys (%{$$map{file}});
+		foreach (keys (%{$$map{sha1}})) {
+			if (sha ($$map{sha1}{$_}) eq $_) {
+				$ok++;
+			} else {
+				warn ("  $$map{$_} checksum does not match\n");
+			}
+		}
+	}
+	print "$ok of $total OK\n";
+}
+$verb{verify} = \&verify;
+
+$help{search} = 'Search for PK3s';
+sub search2 (@) {
+	die ("Search queries required\n") unless (@_);
+	freshen ($uri, $cache, 1);
+	getcache ($cache);
+	foreach my $q (@_) {
+		if (my @r = search ($q)) {
+			print "Results for $q:\n";
+			prpak ($cache{$_}) foreach (sort { $cache{$a}{name} cmp $cache{$b}{name} } @r);
+		} else {
+			print "No results for $q\n";
+		}
+	}
+}
+$verb{search} = \&search2;
+
+$help{install} = 'Install PK3s to the current directory';
+sub install (@) {
+	my $map = dataread ($datafile);
+	die ("You must first 'init' this directory\n") unless ($map);
+	freshen ($uri, $cache, 1);
+	getcache ($cache);
+	my %install;
+	foreach my $q (@_) {
+		if (my @r = search ($q)) {
+			$install{$_} = $cache{$_} foreach (@r);
+		} else {
+			print "No results for $q\n";
+		}
+	}
+	unless (%install) {
+		print "Nothing to do\n";
+		exit;
+	}
+	print "Install PK3s:\n";
+	my $size = 0;
+	my $num = 0;
+	foreach my $r (sort values (%install)) {
+		prpak ($r, $$map{$$r{sha1}});
+		unless ($$map{sha1}{$$r{sha1}}) {
+			$size += $$r{size};
+			$num++;
+		}
+	}
+	exit unless (prompt ("Install $num PK3s for " . prsize ($size)));
+	my %ok;
+	foreach my $r (values (%install)) {
+		next if ($$map{sha1}{$$r{sha1}});
+		my $res = getpak ($r, 1);
+		unless ($res) {
+			print "No links for $$r{name}\n";
+			next;
+		}
+		# with it showing progress, the user can see the error
+		next unless ($res->is_success);
+		if (sha ($$r{name}) ne $$r{sha1}) {
+			warn ("Incorrect checksum for $$r{name}\n");
+			unlink ($$r{name});
+			next;
+		}
+		$ok{$$r{name}} = $r;
+		$$map{file}{$$r{name}} = $$r{sha1};
+		$$map{sha1}{$$r{sha1}} = $$r{name};
+	}
+	unless (%ok) {
+		print "Nothing to do\n";
+		exit;
+	}
+	datawrite ($datafile, $map);
+	print "Installed ", join (', ', keys (%ok)), "\n";
+}
+$verb{install} = \&install;
+
+$help{delete} = 'Delete specified PK3s from the current directory';
+sub del (@) {
+	my $map = dataread ($datafile);
+	die ("You must first 'init' this directory\n") unless ($map);
+	my @del;
+	foreach my $q (@_) {
+		unless (exists ($$map{file}{$q})) {
+			my $e = -e $q;
+			warn ("$q not in $datafile",
+				$e ? '; deleting anyway' : '',
+				"\n");
+			next unless ($e);
+		}
+		unless (unlink ($q)) {
+			warn ("rm $q: $!\n");
+			next;
+		}
+		delete ($$map{sha1}{$$map{file}{$q}});
+		delete ($$map{file}{$q});
+		push (@del, $q);
+	}
+	if (@del) {
+		datawrite ($datafile, $map);
+		print 'Deleted ', join (', ', sort @del), "\n";
+	} else {
+		print "Nothing to do\n";
+	}
+}
+$verb{delete} = \&del;
+
+$help{help} = 'This help thingamabob';
+sub help (@) {
+	my $l = 0;
+	my @verbs = sort map {
+		$l = length if (length > $l);
+		$_;
+	} keys (%verb);
+	print "Help for $0\n";
+	foreach (@verbs) {
+		printf "  %-${l}s    %s\n", $_, $help{$_};
+	}
+}
+$verb{help} = \&help;
+
+my ($action, @args) = @ARGV;
+if (exists ($verb{$action})) {
+	$verb{$action} (@args);
+} elsif (!$ENV{TEST}) {
+	die ("Try $0 help\n");
+}

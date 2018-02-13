@@ -353,7 +353,7 @@ sub verify (@) {
 			if (sha ($$map{sha1}{$_}) eq $_) {
 				$ok++;
 			} else {
-				warn ("  $$map{$_} checksum does not match\n");
+				warn ("  $$map{sha1}{$_} checksum does not match\n");
 			}
 		}
 	}
